@@ -48,31 +48,34 @@ TIM_HandleTypeDef htim1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-#define 	ADC_RESOLUTION						4096.0	// ADC Resolution
+#define 	ADC_RESOLUTION						4096.0	// ADC Resolution 4096.0 = 3.3 Volt
+#define		ADC_REFERENCE						2048	// Reference voltage 3.3 / 2
 
 const int	ARR_COUNT =	640;			// Period of PWM Signal
-const int ARR_DEADTIME = 10;			// PWM Deadtime
+const int ARR_DEADTIME = 5;			// PWM Deadtime
 const int PULSE_MAX =  ARR_COUNT/2 - ARR_DEADTIME; // Maximum pulse width. Set to half due to center-aligned PWM.
+const int PULSE_HALF = PULSE_MAX/2;
 const float PULSE_STEP =  PULSE_MAX / ADC_RESOLUTION;	// Minimum increment of pulses
+
+
+// 16.8 Volt in: PULSEWIDTH =
 
 //#define		DUTY_CONVERSION				100.0/ARR_COUNT
 
 uint16_t pulsewidth = PULSE_MAX / 2;
 uint8_t ADCFlag = 1;
-uint16_t AD_RES = 0;	// ADC Result
+int16_t AD_RES = 2048;	// ADC Result
 uint8_t UART_TX_BUFF[100];
 uint16_t UART_TX_BUFF_LEN;
 
 uint8_t UART_RX_BUFF[4] = {0};
 
-uint32_t currTime = 0;
-uint32_t prevTime = 0;
-uint16_t totError = 0;
-uint16_t rateError = 0;
-float Kp = 1.0;
-float Ki = 0.01;
-float Kd = 0.0;
-
+float kp = 1.0;
+float ki = 0.0;
+float kd = 0.0;
+float ITerm = 0;
+int16_t error = 0;
+int16_t last_error = 0;
 
 //const int ARR = 320;
 //const int DutyMax = ARR/2 - 10;
@@ -141,8 +144,11 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, UART_RX_BUFF, 4);		// Initialize UART Interrupt transmission
   	  // Set to receive 4 bytes (123\n)
   	  // Consider replacing with DMA based receive?
+
   HAL_ADCEx_Calibration_Start(&hadc1);
-  //HAL_ADC_Start_IT(&hadc1);
+  HAL_ADC_Start_IT(&hadc1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  //HAL_TIM_Base_Start_IT(&htim3); // Start PID Sampling timer (ARR = 256, 249027 Hz)
 
 
   /* USER CODE END 2 */
@@ -152,14 +158,13 @@ int main(void)
   while (1)
   {
 
-	if(ADCFlag)
-	{
-
-		HAL_ADC_Start_IT(&hadc1); // Fetch error value
-		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulsewidth);
-		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ARR_COUNT - pulsewidth);
-	}
-	HAL_Delay(100);
+	//if(ADCFlag)
+	//{
+		//HAL_ADC_Start_IT(&hadc1); // Fetch error value
+		//__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulsewidth);
+		//__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ARR_COUNT - pulsewidth);
+	//}
+	//HAL_Delay(100);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -244,8 +249,8 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T3_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
@@ -312,7 +317,7 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
@@ -333,6 +338,12 @@ static void MX_TIM1_Init(void)
   sConfigOC.Pulse = 480;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_LOW;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.Pulse = 320;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -446,22 +457,47 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 	HAL_UART_Receive_IT(&huart2, UART_RX_BUFF, 4); // Enable next UART Receive interrupt
 }
 
-uint32_t read_TIM1() {
-  return TIM1->CNT;
-}
-
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-	// Read & Update The ADC Result
-	prevTime = currTime;
-	currTime = read_TIM1();
-	AD_RES = HAL_ADC_GetValue(&hadc1);
-	totError = AD_RES * (currTime - prevTime);
-	pulsewidth = PULSE_STEP *  (Kp * AD_RES );
-	if(pulsewidth > PULSE_MAX)
+	if(ADCFlag)
+	{
+		AD_RES = HAL_ADC_GetValue(&hadc1);
+
+	error = (int16_t)AD_RES - ADC_REFERENCE;
+
+	//pulsewidth = PULSE_STEP *  (Kp * AD_RES ) + PULSE_HALF;
+	// We use a constant sampling rate, as such we do not need time.
+	// The ki and kd are now dependent on the sampling rate (and must be scaled accordingly).
+
+	ITerm += ki * error;	// Calculate Integral term
+
+	if(ITerm > PULSE_MAX) // Prevent integral windup / integral lag
+	{
+		ITerm = PULSE_MAX;
+	}
+	else if(ITerm < 0)
+	{
+		ITerm = 0;
+	}
+
+	int16_t d_error = error - last_error; // Calculate derivative term
+
+	pulsewidth = (uint16_t) (kp * error + ITerm + kd * d_error);  // Calculate output from PID
+
+	if(pulsewidth > PULSE_MAX) // Prevent output going above max
 	{
 		pulsewidth = PULSE_MAX;
 	}
+	else if(pulsewidth < 0)
+	{
+		pulsewidth = 0;
+	}
+
+	last_error = error; // Store last error term
+	}
+	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulsewidth);
+	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ARR_COUNT - pulsewidth);
+	HAL_ADC_Start_IT(&hadc1);
 }
 
 
