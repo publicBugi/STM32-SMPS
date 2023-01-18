@@ -50,7 +50,7 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 const float ADC_RESOLUTION = 4096.0;	// ADC Resolution 4096.0 = 3.3 Volt
-const float	ADC_REFERENCE = 1613.576;	// Reference voltage 3.3 / 2, actual measured 1.3 V
+const float	ADC_REFERENCE = 1691.028;	// Reference voltage 3.3 / 2, actual measured 1.3 V
 const int	ARR_COUNT =	640;			// Period of PWM Signal
 const int ARR_DEADTIME = 5;			// PWM Deadtime
 const int PULSE_MAX =  ARR_COUNT/2 - ARR_DEADTIME; // Maximum pulse width. Set to half due to center-aligned PWM.
@@ -72,7 +72,7 @@ uint8_t UART_RX_BUFF[4] = {0};
 
 float kp = 0.06;
 float ki = 0.003;
-float kd = 0.00;
+float kd = 0.000;
 float ITerm = 0;
 float error = 0;
 float last_error = 0;
@@ -153,7 +153,7 @@ int main(void)
   HAL_ADC_Start_IT(&hadc1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   //HAL_TIM_Base_Start_IT(&htim3); // Start PID Sampling timer (ARR = 256, 249027 Hz)
-
+  //HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1);
 
   /* USER CODE END 2 */
 
@@ -257,8 +257,8 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
-  hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_1CYCLE_5;
+  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
+  hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_160CYCLES_5;
   hadc1.Init.OversamplingMode = DISABLE;
   hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -513,15 +513,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 	HAL_UART_Receive_IT(&huart2, UART_RX_BUFF, 4); // Enable next UART Receive interrupt
 }
 
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+void PID_update()
 {
-	//AD_RES = HAL_ADC_GetValue(&hadc1);
-	//UART_TX_BUFF_LEN = sprintf(UART_TX_BUFF, "ADC Value: %d\r\n", AD_RES);
-	//HAL_UART_Transmit(&huart2, (uint8_t *)UART_TX_BUFF, UART_TX_BUFF_LEN, 100);
-	if(ADCFlag)
-	{
-		AD_RES = HAL_ADC_GetValue(&hadc1);
-
 	error = AD_RES - ADC_REFERENCE	;
 
 	//pulsewidth = PULSE_STEP *  (Kp * AD_RES ) + PULSE_HALF;
@@ -555,9 +548,56 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 	}
 
 	last_error = error; // Store last error term
-	}
+
 	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulsewidth);
 	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ARR_COUNT - pulsewidth);
+}
+
+unsigned long kalman_filter(unsigned long ADC_Value)
+{
+    float x_k1_k1,x_k_k1;
+    static float ADC_OLD_Value;
+    float Z_k;
+    static float P_k1_k1;
+
+    static float Q = 0.0001;//Q: Regulation noise, Q increases, dynamic response becomes faster, and convergence stability becomes worse
+    static float R = 0.005; //R: Test noise, R increases, dynamic response becomes slower, convergence stability becomes better
+    static float Kg = 0;
+    static float P_k_k1 = 1;
+
+    float kalman_adc;
+    static float kalman_adc_old=0;
+    Z_k = ADC_Value;
+    x_k1_k1 = kalman_adc_old;
+
+    x_k_k1 = x_k1_k1;
+    P_k_k1 = P_k1_k1 + Q;
+
+    Kg = P_k_k1/(P_k_k1 + R);
+
+    kalman_adc = x_k_k1 + Kg * (Z_k - kalman_adc_old);
+    P_k1_k1 = (1 - Kg)*P_k_k1;
+    P_k_k1 = P_k1_k1;
+
+    ADC_OLD_Value = ADC_Value;
+    kalman_adc_old = kalman_adc;
+
+    return kalman_adc;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+	//AD_RES = HAL_ADC_GetValue(&hadc1);
+	//UART_TX_BUFF_LEN = sprintf(UART_TX_BUFF, "ADC Value: %d\r\n", AD_RES);
+	//HAL_UART_Transmit(&huart2, (uint8_t *)UART_TX_BUFF, UART_TX_BUFF_LEN, 100);
+	if(ADCFlag)
+	{
+		AD_RES = kalman_filter(HAL_ADC_GetValue(&hadc1));
+		//AD_RES = HAL_ADC_GetValue(&hadc1);
+		PID_update();
+
+	}
+
 	//HAL_ADC_Start_IT(&hadc1);
 }
 
